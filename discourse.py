@@ -1,6 +1,7 @@
 import requests
 import datetime
 import urllib
+from string import Formatter
 
 """Discourse API in Python
 
@@ -51,7 +52,8 @@ def fixed_delete(url, params):
 	we need to encode it manually here
 	"""
 	if params != None:
-		url += '?' + urllib.urlencode(params)
+		url += '?' + urllib.urlencode(
+			{k: v for k,v in params.iteritems() if v != None})
 	return requests.delete(url)
 
 """API endpoint definition. Each endpoint is specified as a tuple:
@@ -70,7 +72,7 @@ GROUP_PUT =           (requests.put, "/admin/groups/{id}", 'basic_group')
 GROUP_MEMBERS_GET =   (requests.get, "/groups/{name}/members.json", None)
 GROUPS_GET =          (requests.get, "/admin/groups.json", None)
 
-CATEGORY_GET =        (requests.get, "/c/{id}/show.json", 'category')
+CATEGORY_GET =        (requests.get, "/c/{id_or_slug}/show.json", 'category')
 CATEGORY_PUT =        (requests.put, "/categories/{id}", 'category')
 CATEGORY_DELETE =     (fixed_delete, "/categories/{id}", None)
 CATEGORY_SET_NOTIFY = (requests.post, "/category/{id}/notifications", None)
@@ -183,10 +185,22 @@ class ForumObject(object):
 	If needed, the backing dictionary can be accessed directly with `_d`
 	"""
 	def __init__(self, api):
+		if not api:
+			raise Exception("Cannot create a ForumObject with no API")
 		self.api = api
 		self._d = None
 		self.suspended = False
 		self.has_changes = False
+	
+	def request(self, url_tuple, params=None):
+		if params:
+			for i in Formatter().parse(url_tuple[1]):
+				if i[1] and i[1] not in self._d:
+					self.update()
+					break
+		url = url_tuple[1]
+		url = url.format(**self._d)
+		return self.api.request(url_tuple[0], url, url_tuple[2], params)
 	
 	def get_state(self):
 		"""Gets a map of writable properties and their values"""
@@ -208,7 +222,7 @@ class ForumObject(object):
 		"""
 		raise Exception("No endpoint defined!")
 	
-	def update_all_fields(self):
+	def commit_all_fields(self):
 		"""Whether all writable fields need to be updated in a single request
 		
 		Some Discourse endpoints require setting all relevant fields at once,
@@ -218,22 +232,20 @@ class ForumObject(object):
 		return False
 	
 	def commit(self, changes=None):
-		"""Writes back your changes to the server (if not suspended)
+		"""Writes back your changes to the server
 		
 		Args:
 			changes: The map of changed field names to values. If None,
 			`self.get_state()` is used
 		"""
-		if not suspended and (changes or self.has_changes):
-			if not changes:
-				changes = self.get_state()
-			self._d.update(self.api.request(
-				self.put_endpoint(), self._d, changes))
-			self.has_changed = 0
+		if not changes:
+			changes = self.get_state()
+		self._d.update(self.request(self.put_endpoint(), changes))
+		self.has_changes = False
 	
 	def update(self):
 		"""Downloads the object state from the server"""
-		self._d = self.api.request(self.get_endpoint(), self._d)
+		self._d = self.request(self.get_endpoint())
 	
 	def suspend(self):
 		"""Pauses automatic committing when a value is changed"""
@@ -242,7 +254,8 @@ class ForumObject(object):
 	def resume(self):
 		"""Disables the suspension and commits changes"""
 		self.suspended = False
-		self.commit()
+		if self.has_changes:
+			self.commit()
 	
 	def get(self, key):
 		"""Gets a value from the cache or server"""
@@ -252,19 +265,19 @@ class ForumObject(object):
 	
 	def set(self, key, value):
 		"""Sets a value, which will commit changes to the server if needed"""
-		if self.suspended:
-			self._d[key] = value
-		else if key not in self._d or self._d[key] != value:
-			if not self.update_all_fields():
+		self.has_changes = self.has_changes or (key not in self._d or self._d[key] != value)
+		self._d[key] = value
+		if not self.suspended and self.has_changes:
+			if not self.commit_all_fields():
 				self.commit({key: value})
-			else
+			else:
 				self.commit()
 	
 	def __enter__(self):
 		self.suspend()
 		return self
 	
-	def __exit__(self):
+	def __exit__(self, type, value, traceback):
 		self.resume()
 	
 class User(ForumObject):
@@ -280,21 +293,19 @@ class User(ForumObject):
 		else:
 			self._d = params
 	
-	def update(self, complete):
+	def get_endpoint(self):
+		return USER_GET1
+		
+	def put_endpoint(self):
+		return USER_PUT
+	
+	def update(self, complete=True):
 		loaded = False
 		if 'username' in self._d and (complete or 'id' not in self._d):
-			self._d = self.api.request(USER_GET1, self._d)
+			super(User, self).update()
 			loaded = True
 		if complete or not loaded:
-			self._d.update(self.api.request(USER_GET2, self._d))
-	
-	def set(self, name, value):
-		self._d.update(self.api.request(USER_PUT, self._d, {name: value}))
-	
-	def get(self, name):
-		if name not in self._d:
-			self.update(True)
-		return self._d[name]
+			self._d.update(self.request(USER_GET2))
 	
 	def __str__(self):
 		return self.username
@@ -332,8 +343,7 @@ class MemberCollection(object):
 	
 	def __len__(self):
 		if self.__count == None:
-			data = self.__group.api.request(GROUP_MEMBERS_GET,
-				self.__group._Group_d, {'limit': 0})
+			data = self.__group.request(GROUP_MEMBERS_GET, {'limit': 0})
 			self.__count = int(data['meta']['total'])
 		return self.__count
 	
@@ -342,8 +352,7 @@ class MemberCollection(object):
 		offset = self.__offset
 		if not list or i < offset or i >= len(list)+offset:
 			group = self.__group
-			data = group.api.request(GROUP_MEMBERS_GET, self.__group._Group_d,
-				{'offset': i})
+			data = group.request(GROUP_MEMBERS_GET, {'offset': i})
 			self.__offset = i
 			self.__count = int(data['meta']['total'])
 			self.__list = [User(group.api, p) for p in data['members']]
@@ -353,23 +362,21 @@ class Group(ForumObject):
 
 	def __init__(self, api, params):
 		super(Group, self).__init__(api)
-		if isinstance(params, int):
-			self._d = {'id': params}
-			self.update(False)
-		elif isinstance(params, str):
-			self._d = {'username': params}
-			self.update(False)
+		if isinstance(params, str):
+			self._d = {'name': params}
+			self.update()
 		else:
 			self._d = params
 		self.members = MemberCollection(self)
 	
-	def get(self, name):
-		return self._d[name]
+	def get_endpoint(self):
+		return GROUP_GET
 	
-	def set(self, name, value):
-		args = self.get_state()
-		args[name] = value
-		self._d = self.api.request(GROUP_PUT, self._d, args)
+	def put_endpoint(self):
+		return GROUP_PUT
+	
+	def commit_all_fields(self):
+		return True
 	
 	def __str__(self):
 		return self.name
@@ -407,31 +414,27 @@ class Category(ForumObject):
 		else:
 			self._d = params
 	
-	def update(self):
-		if 'id' in self._d:
-			id = str(self._d['id'])
-		else:
-			id = self._d['slug']
-		self._d = self.api.request(CATEGORY_GET, {'id': id})
+	def get_endpoint(self):
+		return CATEGORY_GET
 	
-	def get(self, key):
-		if not key in self._d:
-			self.update()
-		return self._d[key]
+	def put_endpoint(self):
+		return CATEGORY_PUT
+	
+	def commit_all_fields(self):
+		return True
+	
+	def update(self):
+		self._d['id_or_slug'] = self._d.get('id') or self._d['slug']
+		super(Category, self).update()
 	
 	def get_state(self):
-		base = super(Category, self).get_state()
+		state = super(Category, self).get_state()
 		gp = self._d.get('group_permissions')
 		if gp:
 			for x in gp:
-				base["permissions[{0}]".format(x['group_name'])] =
+				state["permissions[{0}]".format(x['group_name'])] = \
 					x['permission_type']
-		return base
-	
-	def set(self, key, value):
-		args = self.get_state()
-		args[key] = value
-		self._d.update(self.api.request(CATEGORY_PUT, self._d, args))
+		return state
 	
 	def get_permission(self, key):
 		p = find(self.get('group_permissions'), lambda x: x['group_name'] == key)
@@ -447,7 +450,8 @@ class Category(ForumObject):
 			self.get('group_permissions').append({
 				'group_name': key,
 				'permission_type': value})
-		self.set('slug', self._d['slug']) # TODO: Dedicated 'upload' function?
+		if not self.suspended:
+			self.commit()
 	
 	@property
 	def notification_level(self):
@@ -455,11 +459,10 @@ class Category(ForumObject):
 	
 	@notification_level.setter
 	def notification_level(self, value):
-		self.api.request(CATEGORY_SET_NOTIFY, self._d, {
-			'notification_level': int(value)})
+		self.request(CATEGORY_SET_NOTIFY, {'notification_level': int(value)})
 	
 	def delete(self):
-		self.api.request(CATEGORY_DELETE, self._d)
+		self.request(CATEGORY_DELETE)
 	
 
 AddProperties(Category, [
@@ -493,6 +496,18 @@ AddProperties(Category, [
 	('custom_fields', reftype, False)
 ])
 
+class ObjectCreator(object):
+	def __init__(self, obj, finish):
+		self.obj = obj
+		self.finish = finish
+
+	def __enter__(self):
+		return self.obj
+	
+	def __exit__(self, e_type, e_value, e_traceback):
+		if not e_type:
+			self.finish(self.obj)
+
 class Discourse(object):
 	
 	def __init__(self, url, apiName=None, apiKey=None):
@@ -500,16 +515,13 @@ class Discourse(object):
 		self.apiName = apiName
 		self.apiKey = apiKey
 	
-	def request(self, url_tuple, d, params=None, throwOnFail=True):
+	def request(self, function, url, member, params=None, throwOnFail=True):
 		if not params:
 			params = {}
 		if self.apiName:
 			params['api_username'] = self.apiName
 		if self.apiKey:
 			params['api_key'] = self.apiKey
-		url = url_tuple[1]
-		url = url.format(**d)
-		function = url_tuple[0]
 		r = function(self.url + url, params)
 		if r.status_code != 200 and not throwOnFail:
 			return None
@@ -519,15 +531,15 @@ class Discourse(object):
 			errors = j.get('errors')
 			if errors:
 				raise Exception(errors)
-		if url_tuple[2] != None:
-			j = j[url_tuple[2]]
+		if member:
+			j = j[member]
 		return j
 	
 	def groups(self):
 		return [Group(self, p) for p in self.request(GROUPS_GET, {})]
 	
 	def group(self, name):
-		return Group(self, self.request(GROUP_GET, {'name': name}))
+		return Group(self, name)
 
 	def user(self, name):
 		return User(self, name)
@@ -542,8 +554,8 @@ class Discourse(object):
 			'text_color': 'FFFFFF',
 			'parent_category_id': None,
 			'allow_badges': True})
-		print self.request(CATEGORY_ADD, cat._d, cat.get_state())
-		return cat
-
-
-
+		cat.suspend()
+		def cat_create(c):
+			cat._d = cat.request(CATEGORY_ADD, c.get_state())
+			cat.suspended = False
+		return ObjectCreator(cat, cat_create)
