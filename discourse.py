@@ -2,6 +2,7 @@ import requests
 import datetime
 import urllib
 from string import Formatter
+import collections
 
 """Discourse API in Python
 
@@ -69,8 +70,17 @@ USER_PUT =            (requests.put, "/users/{username}", 'user')
 
 GROUP_GET =           (requests.get, "/groups/{name}.json", 'basic_group')
 GROUP_PUT =           (requests.put, "/admin/groups/{id}", 'basic_group')
-GROUP_MEMBERS_GET =   (requests.get, "/groups/{name}/members.json", None)
+GROUP_DELETE =        (fixed_delete, "/admin/groups/{id}", None)
+GROUP_ADD =           (requests.post, "/admin/groups", 'basic_group')
 GROUPS_GET =          (requests.get, "/admin/groups.json", None)
+
+GROUP_OWNERS_GET =    (requests.get, "/groups/{name}/members.json", 'owners')
+GROUP_OWNERS_ADD =    (requests.put, "/admin/groups/{id}/owners.json", None)
+GROUP_OWNERS_REMOVE = (fixed_delete, "/admin/groups/{id}/owners.json", None)
+GROUP_MEMBERS_GET =   (requests.get, "/groups/{name}/members.json", None)
+GROUP_MEMBERS_ADD =   (requests.put, "/admin/groups/{id}/members.json", None)
+GROUP_MEMBERS_REMOVE = (fixed_delete, "/admin/groups/{id}/members.json", None)
+GROUP_ADD_BULK =      (requests.put, "/admin/groups/bulk", None)
 
 CATEGORY_GET =        (requests.get, "/c/{id_or_slug}/show.json", 'category')
 CATEGORY_PUT =        (requests.put, "/categories/{id}", 'category')
@@ -113,21 +123,34 @@ def find(list, f, default=None):
 		if f(x):
 			return x
 	return default
+
+def is_iterable(o):
+	return isinstance(o, collections.Iterable) and not isinstance(o, str)
 	
 class Permission:
-	"""Constants for category permissions"""
+	"""Constants for category permissions.
+	Describes what a given group can do within that category"""
 	NONE = 0
 	ALL = 1
 	REPLY = 2
 	VIEW = 3
 
 class NotifyLevel:
-	"""Constants for category notification levels"""
+	"""Constants for category notification levels
+	Describes what sort of actions trigger user notifications"""
 	MUTED = 0
 	NORMAL = 1
 	WATCHING_FIRST_POST = 4
 	TRACKING = 2
 	WATCHING = 3
+
+class AliasLevel:
+	"""Constants for group `alias_level`
+	Describes who can @mention this group"""
+	NOBODY = 0
+	STAFF = 2
+	GROUP_MEMBERS = 3
+	EVERYONE = 99
 
 def AddProperties(c, list):
 	"""Adds named properties to a ForumObject class
@@ -265,7 +288,8 @@ class ForumObject(object):
 	
 	def set(self, key, value):
 		"""Sets a value, which will commit changes to the server if needed"""
-		self.has_changes = self.has_changes or (key not in self._d or self._d[key] != value)
+		self.has_changes = self.has_changes or \
+			(key not in self._d or self._d[key] != value)
 		self._d[key] = value
 		if not self.suspended and self.has_changes:
 			if not self.commit_all_fields():
@@ -279,6 +303,19 @@ class ForumObject(object):
 	
 	def __exit__(self, type, value, traceback):
 		self.resume()
+	
+	def __eq__(self, y):
+		if not isinstance(y, type(self)):
+			return False
+		return self.id == y.id
+	
+	def __ne__(self, y):
+		if not isinstance(y, type(self)):
+			return False
+		return self.id != y.id
+	
+	def __hash__(self):
+		return self.id
 	
 class User(ForumObject):
 
@@ -332,31 +369,128 @@ AddProperties(User, [
 	'title'
 ])
 
+class UserList(object):
+	def __init__(self, group):
+		self._group = group
+		self._list = None
 	
-class MemberCollection(object):
+	def get_endpoint(self):
+		raise Exception("Endpoint not defined")
+	
+	def add_endpoint(self):
+		raise Exception("Endpoint not defined")
+	
+	def del_endpoint(self):
+		raise Exception("Endpoint not defined")
+	
+	def add(self, members):
+		if not is_iterable(members):
+			members = [members]
+		else:
+			members = list(members)
+		for i in range(len(members)):
+			m = members[i]
+			if not isinstance(m, str):
+				if isinstance(m, User):
+					members[i] = m.username
+				else:
+					members[i] = self._group.api.user(m).username
+		self._group.request(self.add_endpoint(), \
+			{'usernames': ",".join(members)})
+		self._list = None
+	
+	def remove(self, members):
+		if not is_iterable(members):
+			members = [members]
+		for i in members:
+			if not isinstance(i, int):
+				if isinstance(i, User):
+					i = i.id
+				else:
+					i = self._group.api.user(i).id
+			self._group.request(self.del_endpoint(), {'user_id': i})
+		self._list = None
+
+	def update(self):
+		self._list = self._group.request(self.get_endpoint())
+	
+	def __len__(self):
+		if not self._list:
+			self.update()
+		return len(self._list)
+	
+	def __getitem__(self, i):
+		if not self._list:
+			self.update()
+		return User(self._group.api, self._list[i])
+			
+	def replace_all(self, members):
+		if not self._list:
+			self.update()
+		members = list(members) if is_iterable(members) else [members]
+		toAdd = set()
+		for i in range(len(members)):
+			m = members[i]
+			if not isinstance(m, User):
+				toAdd.add(self._group.api.user(m))
+			else:
+				toAdd.add(m)
+		toRemove = {o for o in self._list}
+		cmdRemove = toRemove.difference(toAdd)
+		cmdAdd = ",".join(toAdd.difference(toRemove))
+		self._group.request(self.add_endpoint(), {'usernames': cmdAdd})
+		for id in cmdRemove:
+			self._group.request(self.del_endpoint(), {'user_id': id})
+		self._list = members
+	
+class MemberList(UserList):
 
 	def __init__(self, group):
-		self.__group = group
-		self.__list = None
+		super(MemberList, self).__init__(group)
 		self.__offset = 0
 		self.__count = None
 	
+	def get_endpoint(self):
+		return GROUP_MEMBERS_GET
+
+	def add_endpoint(self):
+		return GROUP_MEMBERS_ADD
+
+	def del_endpoint(self):
+		return GROUP_MEMBERS_REMOVE
+	
 	def __len__(self):
 		if self.__count == None:
-			data = self.__group.request(GROUP_MEMBERS_GET, {'limit': 0})
+			data = self._group.request(self.get_endpoint(), {'limit': 0})
 			self.__count = int(data['meta']['total'])
 		return self.__count
 	
 	def __getitem__(self, i):
-		list = self.__list
+		list = self._list
 		offset = self.__offset
 		if not list or i < offset or i >= len(list)+offset:
-			group = self.__group
-			data = group.request(GROUP_MEMBERS_GET, {'offset': i})
+			group = self._group
+			data = group.request(self.get_endpoint(), {'offset': i})
 			self.__offset = i
 			self.__count = int(data['meta']['total'])
-			self.__list = [User(group.api, p) for p in data['members']]
-		return self.__list[i - self.__offset]
+			self._list = [User(group.api, p) for p in data['members']]
+		return self._list[i - self.__offset]
+	
+	def add_bulk(self, emails):
+		self._group.request(GROUP_ADD_BULK, {
+			'group_id': self._group.id, 'users[]': emails})
+		self._list = None
+
+class OwnerList(UserList):
+	def get_endpoint(self):
+		return GROUP_OWNERS_GET
+
+	def add_endpoint(self):
+		return GROUP_OWNERS_ADD
+
+	def del_endpoint(self):
+		return GROUP_OWNERS_REMOVE
+
 
 class Group(ForumObject):
 
@@ -367,7 +501,14 @@ class Group(ForumObject):
 			self.update()
 		else:
 			self._d = params
-		self.members = MemberCollection(self)
+		self.__members = MemberList(self)
+		self.__owners = OwnerList(self)
+	
+	members = property(lambda s: s.__members, 
+		lambda s,v: s.__members.replace_all(v))
+	
+	owners = property(lambda s: s.__owners, 
+		lambda s,v: s.__owners.replace_all(v))
 	
 	def get_endpoint(self):
 		return GROUP_GET
@@ -377,6 +518,9 @@ class Group(ForumObject):
 	
 	def commit_all_fields(self):
 		return True
+	
+	def delete():
+		self.request(GROUP_DELETE)
 	
 	def __str__(self):
 		return self.name
@@ -437,13 +581,15 @@ class Category(ForumObject):
 		return state
 	
 	def get_permission(self, key):
-		p = find(self.get('group_permissions'), lambda x: x['group_name'] == key)
+		p = find(self.get('group_permissions'),
+			lambda x: x['group_name'] == key)
 		if p:
 			return p['permission_type']
 		return Permission.NONE
 	
 	def set_permission(self, key, value):
-		p = find(self.get('group_permissions'), lambda x: x['group_name'] == key)
+		p = find(self.get('group_permissions'),
+			lambda x: x['group_name'] == key)
 		if p:
 			p['permission_type'] = int(value)
 		else:
@@ -536,7 +682,7 @@ class Discourse(object):
 		return j
 	
 	def groups(self):
-		return [Group(self, p) for p in self.request(GROUPS_GET, {})]
+		return [Group(self, p) for p in self.request(GROUPS_GET)]
 	
 	def group(self, name):
 		return Group(self, name)
@@ -547,12 +693,28 @@ class Discourse(object):
 	def category(self, id):
 		return Category(self, id)
 	
+	def search_users(self, term, include_groups=False,
+		include_mentionable_groups=False, topic_allowed_users=False):
+		# GET /users/search/users
+		pass
+	
+	def add_group(self, name):
+		group = Group(self, {
+			'name': name,
+			'visible': True,
+			'automatic_membership_retroactive': False,
+			'primary_group': False})
+		group.suspend()
+		def group_create(g):
+			g._d = g.request(GROUP_ADD, g.get_state())
+			g.suspended = False
+		return ObjectCreator(g, group_create)
+	
 	def add_category(self, name):
 		cat = Category(self, {
 			'name': name,
 			'color': 'AB9364',
 			'text_color': 'FFFFFF',
-			'parent_category_id': None,
 			'allow_badges': True})
 		cat.suspend()
 		def cat_create(c):
