@@ -480,6 +480,13 @@ class MemberList(UserList):
 		self._group.request(GROUP_ADD_BULK, {
 			'group_id': self._group.id, 'users[]': emails})
 		self._list = None
+	
+	def to_list(self, f=None):
+		data = self._group.request(self.get_endpoint(), 
+			{'offset': 0, 'limit': self.__len__()})
+		if f != None:
+			return [f(p) for p in data['members']]
+		return [User(self._group.api, p) for p in data['members']]
 
 class OwnerList(UserList):
 	def get_endpoint(self):
